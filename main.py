@@ -218,7 +218,7 @@ async def generate_final_pdf(request: GeneratePDFRequest):
         approval_page = generate_approval_page(invoice, approvals_payload)
         final_pdf = merge_pdfs(original, approval_page)
 
-        final_path = f"{STORAGE_BUCKET}/final/{invoice['invoice_number']}_aprobado.pdf"
+        final_path = f"{STORAGE_BUCKET}/aprobadas/{invoice['supplier_nit']}/{invoice['invoice_number']}_aprobada.pdf"
         await upload_final_pdf(client, final_path, final_pdf)
         await patch_invoice_final_path(client, request.invoice_id, final_path)
 
