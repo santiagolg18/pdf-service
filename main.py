@@ -22,6 +22,7 @@ Variables de entorno requeridas:
 import base64
 import datetime
 import io
+import logging
 import os
 
 import httpx
@@ -32,11 +33,40 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+logger = logging.getLogger("pdf-service")
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 STORAGE_BUCKET = os.environ.get("STORAGE_BUCKET", "invoices")
+
+# Sello de certificación que se estampa en la hoja de constancia.
+APPROVAL_STAMP_URL = os.environ.get(
+    "APPROVAL_STAMP_URL",
+    "https://res.cloudinary.com/dqnsskjfg/image/upload/v1779891594/Aprobacion_factura_aequ86.png",
+)
+# Caché en memoria del sello para no descargarlo en cada request.
+_stamp_cache: bytes | None = None
+
+
+async def fetch_approval_stamp(client: httpx.AsyncClient) -> bytes | None:
+    """Descarga (y cachea) el sello de certificación.
+
+    El sello es decorativo: si la URL cambia, no responde o devuelve algo
+    inesperado, devolvemos None y el PDF se genera sin sello.
+    """
+    global _stamp_cache
+    if _stamp_cache is not None:
+        return _stamp_cache
+    try:
+        resp = await client.get(APPROVAL_STAMP_URL)
+        resp.raise_for_status()
+        _stamp_cache = resp.content
+        return _stamp_cache
+    except Exception as exc:  # noqa: BLE001 — sello decorativo, nunca debe romper el flujo
+        logger.warning("No se pudo descargar el sello de aprobación (%s): %s", APPROVAL_STAMP_URL, exc)
+        return None
 
 SB_HEADERS = {
     "apikey": SUPABASE_KEY,
@@ -50,7 +80,7 @@ class GeneratePDFRequest(BaseModel):
     invoice_id: str
 
 
-def generate_approval_page(invoice, approvals) -> io.BytesIO:
+def generate_approval_page(invoice, approvals, stamp_bytes: bytes | None = None) -> io.BytesIO:
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer, pagesize=letter, topMargin=0.75 * inch, bottomMargin=0.75 * inch
@@ -92,7 +122,12 @@ def generate_approval_page(invoice, approvals) -> io.BytesIO:
     header = ["#", "Aprobador", "Estado", "Fecha y Hora"]
     rows = [header]
     for i, a in enumerate(approvals, 1):
-        status_text = "APROBADO" if a["status"] == "approved" else "RECHAZADO"
+        status_labels = {
+            "approved": "APROBADO",
+            "rejected": "RECHAZADO",
+            "pending": "PENDIENTE",
+        }
+        status_text = status_labels.get(a["status"], "PENDIENTE")
         date_str = a.get("approved_at") or "Pendiente"
         if date_str != "Pendiente":
             try:
@@ -122,6 +157,21 @@ def generate_approval_page(invoice, approvals) -> io.BytesIO:
     )
     elements.append(approval_table)
     elements.append(Spacer(1, 30))
+
+    if stamp_bytes:
+        # Sello de certificación: escalado a 2.5" de ancho conservando proporción.
+        # Es decorativo; si los bytes no son una imagen válida, se omite sin romper el PDF.
+        try:
+            stamp = Image(io.BytesIO(stamp_bytes))
+            target_width = 2.5 * inch
+            aspect = stamp.imageHeight / float(stamp.imageWidth)
+            stamp.drawWidth = target_width
+            stamp.drawHeight = target_width * aspect
+            stamp.hAlign = "CENTER"
+            elements.append(stamp)
+            elements.append(Spacer(1, 20))
+        except Exception as exc:  # noqa: BLE001 — sello decorativo, nunca debe romper el flujo
+            logger.warning("No se pudo renderizar el sello de aprobación: %s", exc)
 
     gen_date = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     elements.append(
@@ -215,7 +265,8 @@ async def generate_final_pdf(request: GeneratePDFRequest):
             for a in invoice.get("approvals", [])
         ]
 
-        approval_page = generate_approval_page(invoice, approvals_payload)
+        stamp_bytes = await fetch_approval_stamp(client)
+        approval_page = generate_approval_page(invoice, approvals_payload, stamp_bytes)
         final_pdf = merge_pdfs(original, approval_page)
 
         final_path = f"{STORAGE_BUCKET}/aprobadas/{invoice['supplier_nit']}/{invoice['invoice_number']}_aprobada.pdf"
