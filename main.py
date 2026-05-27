@@ -132,6 +132,8 @@ def generate_approval_page(invoice, approvals, stamp_bytes: bytes | None = None)
         if date_str != "Pendiente":
             try:
                 dt = datetime.datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                colombia_tz = datetime.timezone(datetime.timedelta(hours=-5))
+                dt = dt.astimezone(colombia_tz)
                 date_str = dt.strftime("%d/%m/%Y %H:%M:%S")
             except ValueError:
                 pass
@@ -173,7 +175,8 @@ def generate_approval_page(invoice, approvals, stamp_bytes: bytes | None = None)
         except Exception as exc:  # noqa: BLE001 — sello decorativo, nunca debe romper el flujo
             logger.warning("No se pudo renderizar el sello de aprobación: %s", exc)
 
-    gen_date = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    colombia_tz = datetime.timezone(datetime.timedelta(hours=-5))
+    gen_date = datetime.datetime.now(tz=colombia_tz).strftime("%d/%m/%Y %H:%M:%S")
     elements.append(
         Paragraph(
             f"<i>Documento generado automáticamente el {gen_date}. "
