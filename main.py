@@ -24,6 +24,7 @@ import datetime
 import io
 import logging
 import os
+from xml.sax.saxutils import escape
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -33,7 +34,15 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
-from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import (
+    Image,
+    KeepInFrame,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
 
 logger = logging.getLogger("pdf-service")
 
@@ -80,6 +89,133 @@ class GeneratePDFRequest(BaseModel):
     invoice_id: str
 
 
+# Tope de las observaciones de Compras en la constancia. La hoja se encoge sola
+# para que todo quepa en una página (KeepInFrame más abajo), pero sin un tope un
+# análisis de varias páginas encogería la letra hasta volverla ilegible. ~1.800
+# caracteres son unos 20 renglones a 9 pt en 6,5" de ancho: caben con un
+# encogimiento leve. El texto completo siempre queda en la plataforma.
+MAX_NOTES_CHARS = 1800
+
+TRUNCATION_SUFFIX = " […texto completo en la plataforma]"
+
+
+def format_previous_amount(invoice) -> str | None:
+    """"$1.100.000,00 (subió 12,2%, +$134.000,00)" a partir del valor anterior.
+
+    Devuelve None cuando no hay comparación posible: el campo es opcional y con
+    un valor anterior de 0 (o negativo) el porcentaje no significaría nada.
+    """
+    raw = invoice.get("previous_amount")
+    if raw is None:
+        return None
+    try:
+        previous = float(raw)
+        current = float(invoice["total_amount"])
+    except (TypeError, ValueError):
+        return None
+    if previous <= 0:
+        return None
+
+    base = f"${previous:,.2f}"
+    delta = current - previous
+    # Diferencias por debajo de un peso son ruido de redondeo, no un cambio real.
+    if abs(delta) < 1:
+        return f"{base} (se mantiene)"
+    verb = "subió" if delta > 0 else "bajó"
+    sign = "+" if delta > 0 else "-"
+    percent = abs(delta / previous) * 100
+    return f"{base} ({verb} {percent:.1f}%, {sign}${abs(delta):,.2f})"
+
+
+def clean_notes(raw: str | None) -> str | None:
+    """Deja las observaciones listas para meterlas en un Paragraph de reportlab."""
+    if not raw:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+
+    if len(text) > MAX_NOTES_CHARS:
+        # Cortar en el último espacio para no partir una palabra por la mitad.
+        cut = text[:MAX_NOTES_CHARS]
+        space = cut.rfind(" ")
+        if space > MAX_NOTES_CHARS // 2:
+            cut = cut[:space]
+        text = cut.rstrip(" ,.;:") + TRUNCATION_SUFFIX
+
+    # Paragraph interpreta mini-HTML: sin escapar, un "precio < 100 & IVA"
+    # escrito por el usuario rompería la generación del PDF entera.
+    return escape(text).replace("\n", "<br/>")
+
+
+def build_review_block(invoice, styles) -> list:
+    """Flowables del resumen de la revisión de compras.
+
+    Devuelve [] si la factura no trae ningún dato de revisión, para que las
+    facturas anteriores a esta funcionalidad generen su constancia igual que antes.
+    """
+    cost_center = (invoice.get("cost_centers") or {}).get("name")
+    previous_text = format_previous_amount(invoice)
+    notes = clean_notes(invoice.get("review_notes"))
+
+    if not cost_center and not previous_text and not notes:
+        return []
+
+    elements = [
+        Paragraph("Resumen de la Revisión de Compras:", styles["Heading2"]),
+        Spacer(1, 8),
+    ]
+
+    rows = []
+    if cost_center:
+        rows.append(["Centro de Costo:", cost_center])
+    if previous_text:
+        rows.append(["Valor Anterior:", previous_text])
+    if rows:
+        review_table = Table(rows, colWidths=[2 * inch, 4 * inch])
+        review_table.setStyle(
+            TableStyle(
+                [
+                    ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                    ("FONTNAME", (1, 0), (1, -1), "Helvetica"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 11),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                    ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ]
+            )
+        )
+        elements.append(review_table)
+
+    if notes:
+        # Las tablas de esta hoja miden 6" en un marco de 6,5" y reportlab las
+        # centra, así que arrancan 0,25" adentro. Las observaciones llevan el
+        # mismo margen para que "Observaciones:" quede alineado con
+        # "Centro de Costo:" en vez de sobresalir por la izquierda.
+        table_indent = 0.25 * inch
+        label_style = ParagraphStyle(
+            "ReviewNotesLabel",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=11,
+            spaceBefore=6,
+            spaceAfter=4,
+            leftIndent=table_indent,
+        )
+        notes_style = ParagraphStyle(
+            "ReviewNotes",
+            parent=styles["Normal"],
+            fontSize=9.5,
+            leading=13,
+            leftIndent=table_indent + 6,
+            rightIndent=table_indent,
+        )
+        elements.append(Paragraph("Observaciones:", label_style))
+        elements.append(Paragraph(notes, notes_style))
+
+    elements.append(Spacer(1, 24))
+    return elements
+
+
 def generate_approval_page(invoice, approvals, stamp_bytes: bytes | None = None) -> io.BytesIO:
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -116,6 +252,10 @@ def generate_approval_page(invoice, approvals, stamp_bytes: bytes | None = None)
     )
     elements.append(info_table)
     elements.append(Spacer(1, 24))
+
+    # Lo que revisó Compras antes de liberar la factura a los aprobadores.
+    elements.extend(build_review_block(invoice, styles))
+
     elements.append(Paragraph("Registro de Aprobaciones:", styles["Heading2"]))
     elements.append(Spacer(1, 8))
 
@@ -186,7 +326,11 @@ def generate_approval_page(invoice, approvals, stamp_bytes: bytes | None = None)
         )
     )
 
-    doc.build(elements)
+    # La constancia SIEMPRE debe ser una sola hoja. KeepInFrame en modo "shrink"
+    # escala el contenido hacia abajo si no cabe en el marco, y no lo toca si cabe.
+    # Junto con MAX_NOTES_CHARS, garantiza una hoja única y legible por larga que
+    # sea la observación que escribió Compras.
+    doc.build([KeepInFrame(doc.width, doc.height, elements, mode="shrink")])
     buffer.seek(0)
     return buffer
 
@@ -205,7 +349,7 @@ async def fetch_invoice_bundle(client: httpx.AsyncClient, invoice_id: str) -> di
     query = (
         f"{SUPABASE_URL}/rest/v1/invoices"
         f"?id=eq.{invoice_id}"
-        f"&select=*,approvals(*,approvers(name,email))"
+        f"&select=*,cost_centers(name),approvals(*,approvers(name,email))"
     )
     resp = await client.get(query, headers=SB_HEADERS)
     resp.raise_for_status()
