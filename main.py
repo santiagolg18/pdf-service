@@ -11,8 +11,8 @@ Flujo:
   3. Descarga de Storage la factura original, la orden de compra y los soportes,
      y convierte a PDF los que son imágenes (collect_documents).
   4. Genera la hoja de constancia con reportlab: datos de la factura, resumen de
-     la revisión de compras, índice del expediente y registro de aprobaciones.
-     Siempre ocupa UNA página.
+     la revisión de compras, compilado de observaciones (Compras y aprobadores),
+     índice del expediente y registro de aprobaciones. Siempre ocupa UNA página.
   5. Fusiona constancia + documentos con PyPDF2, en ese orden.
   6. Sube el PDF final a Storage y actualiza invoices.final_pdf_path.
   7. Responde con la ruta + base64 del PDF (opcional para adjuntar en email).
@@ -124,14 +124,23 @@ def aligned_block(flowables) -> Table:
     return table
 
 
-# Tope de las observaciones de Compras en la constancia. La hoja se encoge sola
-# para que todo quepa en una página (KeepInFrame más abajo), pero sin un tope un
-# análisis de varias páginas encogería la letra hasta volverla ilegible. ~1.800
-# caracteres son unos 20 renglones a 9 pt en 6,5" de ancho: caben con un
-# encogimiento leve. El texto completo siempre queda en la plataforma.
-MAX_NOTES_CHARS = 1800
+# Tope TOTAL del compilado de observaciones (Compras + aprobadores) en la
+# constancia. La hoja se encoge sola para que todo quepa en una página
+# (KeepInFrame más abajo), pero sin un tope varias notas largas encogerían la
+# letra hasta volverla ilegible. ~2.400 caracteres son unos 26 renglones a
+# 9,5 pt en 6" de ancho: caben con un encogimiento leve. El texto completo
+# siempre queda en la plataforma.
+MAX_NOTES_CHARS = 2400
+
+# Si lo que queda del tope no alcanza para una nota útil, las que faltan se
+# cuentan en vez de mostrarse cortadas a unas pocas palabras.
+MIN_NOTE_CHARS = 200
 
 TRUNCATION_SUFFIX = " […texto completo en la plataforma]"
+
+COLOMBIA_TZ = datetime.timezone(datetime.timedelta(hours=-5))
+
+APPROVAL_VERBS = {"approved": "Aprobó", "rejected": "Rechazó"}
 
 
 def format_previous_amount(invoice) -> str | None:
@@ -162,19 +171,19 @@ def format_previous_amount(invoice) -> str | None:
     return f"{base} ({verb} {percent:.1f}%, {sign}${abs(delta):,.2f})"
 
 
-def clean_notes(raw: str | None) -> str | None:
-    """Deja las observaciones listas para meterlas en un Paragraph de reportlab."""
+def clean_notes(raw: str | None, limit: int = MAX_NOTES_CHARS) -> str | None:
+    """Deja una observación lista para meterla en un Paragraph de reportlab."""
     if not raw:
         return None
     text = raw.strip()
     if not text:
         return None
 
-    if len(text) > MAX_NOTES_CHARS:
+    if len(text) > limit:
         # Cortar en el último espacio para no partir una palabra por la mitad.
-        cut = text[:MAX_NOTES_CHARS]
+        cut = text[:limit]
         space = cut.rfind(" ")
-        if space > MAX_NOTES_CHARS // 2:
+        if space > limit // 2:
             cut = cut[:space]
         text = cut.rstrip(" ,.;:") + TRUNCATION_SUFFIX
 
@@ -188,62 +197,146 @@ def build_review_block(invoice, styles) -> list:
 
     Devuelve [] si la factura no trae ningún dato de revisión, para que las
     facturas anteriores a esta funcionalidad generen su constancia igual que antes.
+    Las observaciones de Compras van en el compilado (build_comments_block).
     """
     cost_center = (invoice.get("cost_centers") or {}).get("name")
     previous_text = format_previous_amount(invoice)
-    notes = clean_notes(invoice.get("review_notes"))
-
-    if not cost_center and not previous_text and not notes:
-        return []
-
-    elements = [
-        Paragraph("Resumen de la Revisión de Compras:", styles["Heading2"]),
-        Spacer(1, 8),
-    ]
 
     rows = []
     if cost_center:
         rows.append(["Centro de Costo:", cost_center])
     if previous_text:
         rows.append(["Valor Anterior:", previous_text])
-    if rows:
-        review_table = Table(rows, colWidths=[2 * inch, 4 * inch])
-        review_table.setStyle(
-            TableStyle(
-                [
-                    ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
-                    ("FONTNAME", (1, 0), (1, -1), "Helvetica"),
-                    ("FONTSIZE", (0, 0), (-1, -1), 11),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-                    ("TOPPADDING", (0, 0), (-1, -1), 4),
-                ]
-            )
-        )
-        elements.append(review_table)
+    if not rows:
+        return []
 
-    if notes:
-        label_style = ParagraphStyle(
-            "ReviewNotesLabel",
-            parent=styles["Normal"],
-            fontName="Helvetica-Bold",
-            fontSize=11,
-            spaceBefore=6,
-            spaceAfter=4,
+    review_table = Table(rows, colWidths=[2 * inch, 4 * inch])
+    review_table.setStyle(
+        TableStyle(
+            [
+                ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                ("FONTNAME", (1, 0), (1, -1), "Helvetica"),
+                ("FONTSIZE", (0, 0), (-1, -1), 11),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ]
         )
-        notes_style = ParagraphStyle(
-            "ReviewNotes",
-            parent=styles["Normal"],
-            fontSize=9.5,
-            leading=13,
-        )
-        elements.append(
-            aligned_block(
-                [Paragraph("Observaciones:", label_style), Paragraph(notes, notes_style)]
-            )
+    )
+    return [
+        Paragraph("Resumen de la Revisión de Compras:", styles["Heading2"]),
+        Spacer(1, 8),
+        review_table,
+        Spacer(1, 24),
+    ]
+
+
+def format_colombia_datetime(raw: str | None, fmt: str = "%d/%m/%Y %H:%M:%S") -> str | None:
+    """Fecha ISO de Supabase → texto en hora de Colombia (UTC-5).
+
+    Devuelve None si no hay fecha, y el texto tal cual si no se puede interpretar.
+    """
+    if not raw:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return raw
+    return dt.astimezone(COLOMBIA_TZ).strftime(fmt)
+
+
+def collect_comments(invoice) -> list[dict]:
+    """Todo lo que se escribió sobre la factura.
+
+    Mismo orden que el ícono de comentarios de la plataforma
+    (lib/invoices/comments.ts): primero la observación de Compras y luego las
+    notas de los aprobadores en el orden en que decidieron.
+    """
+    comments = []
+
+    review_notes = (invoice.get("review_notes") or "").strip()
+    if review_notes:
+        reviewer = (invoice.get("reviewer") or {}).get("name")
+        comments.append(
+            {
+                "author": reviewer or "Compras",
+                "role": "Compras",
+                "at": invoice.get("reviewed_at"),
+                "text": review_notes,
+            }
         )
 
-    elements.append(Spacer(1, 24))
-    return elements
+    noted = [a for a in invoice.get("approvals") or [] if (a.get("notes") or "").strip()]
+    # Las que aún no tienen fecha de decisión, al final.
+    noted.sort(key=lambda a: (a.get("approved_at") is None, a.get("approved_at") or ""))
+    for a in noted:
+        comments.append(
+            {
+                "author": (a.get("approvers") or {}).get("name") or "—",
+                "role": APPROVAL_VERBS.get(a.get("status"), "Aprobador"),
+                "at": a.get("approved_at"),
+                "text": a["notes"].strip(),
+            }
+        )
+
+    return comments
+
+
+def build_comments_block(comments, styles) -> list:
+    """Compilado de observaciones: quién escribió, en qué papel, cuándo y qué.
+
+    Devuelve [] si nadie escribió nada, para que la hoja quede como antes.
+    """
+    if not comments:
+        return []
+
+    header_style = ParagraphStyle(
+        "CommentHeader",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=9.5,
+        leading=12,
+        spaceAfter=2,
+    )
+    text_style = ParagraphStyle(
+        "CommentText",
+        parent=styles["Normal"],
+        fontSize=9.5,
+        leading=13,
+        spaceAfter=6,
+    )
+
+    rows = []
+    remaining = MAX_NOTES_CHARS
+    for i, comment in enumerate(comments):
+        if remaining < MIN_NOTE_CHARS:
+            left = len(comments) - i
+            more = "1 observación más" if left == 1 else f"{left} observaciones más"
+            rows.append(
+                [Paragraph(f"<i>… y {more} (consultar en la plataforma).</i>", text_style)]
+            )
+            break
+
+        label = comment["author"]
+        if comment["author"] != comment["role"]:
+            label = f"{label} — {comment['role']}"
+        date = format_colombia_datetime(comment["at"], "%d/%m/%Y %H:%M")
+        if date:
+            label = f"{label} · {date}"
+
+        rows.append(
+            [
+                Paragraph(escape(label), header_style),
+                Paragraph(clean_notes(comment["text"], remaining), text_style),
+            ]
+        )
+        remaining -= min(len(comment["text"]), remaining)
+
+    return [
+        Paragraph("Observaciones:", styles["Heading2"]),
+        Spacer(1, 4),
+        aligned_block(rows),
+        Spacer(1, 18),
+    ]
 
 
 def build_index_block(documents, skipped, styles) -> list:
@@ -356,6 +449,9 @@ def generate_approval_page(
     # Lo que revisó Compras antes de liberar la factura a los aprobadores.
     elements.extend(build_review_block(invoice, styles))
 
+    # Todo lo que escribieron Compras y los aprobadores sobre esta factura.
+    elements.extend(build_comments_block(collect_comments(invoice), styles))
+
     # Índice del expediente: factura, orden de compra y soportes.
     elements.extend(build_index_block(documents or [], skipped or [], styles))
 
@@ -371,15 +467,7 @@ def generate_approval_page(
             "pending": "PENDIENTE",
         }
         status_text = status_labels.get(a["status"], "PENDIENTE")
-        date_str = a.get("approved_at") or "Pendiente"
-        if date_str != "Pendiente":
-            try:
-                dt = datetime.datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-                colombia_tz = datetime.timezone(datetime.timedelta(hours=-5))
-                dt = dt.astimezone(colombia_tz)
-                date_str = dt.strftime("%d/%m/%Y %H:%M:%S")
-            except ValueError:
-                pass
+        date_str = format_colombia_datetime(a.get("approved_at")) or "Pendiente"
         rows.append([str(i), a["approver_name"], status_text, date_str])
 
     approval_table = Table(
@@ -418,8 +506,7 @@ def generate_approval_page(
         except Exception as exc:  # noqa: BLE001 — sello decorativo, nunca debe romper el flujo
             logger.warning("No se pudo renderizar el sello de aprobación: %s", exc)
 
-    colombia_tz = datetime.timezone(datetime.timedelta(hours=-5))
-    gen_date = datetime.datetime.now(tz=colombia_tz).strftime("%d/%m/%Y %H:%M:%S")
+    gen_date = datetime.datetime.now(tz=COLOMBIA_TZ).strftime("%d/%m/%Y %H:%M:%S")
     elements.append(
         Paragraph(
             f"<i>Documento generado automáticamente el {gen_date}. "
@@ -431,8 +518,8 @@ def generate_approval_page(
 
     # La constancia SIEMPRE debe ser una sola hoja. KeepInFrame en modo "shrink"
     # escala el contenido hacia abajo si no cabe en el marco, y no lo toca si cabe.
-    # Junto con MAX_NOTES_CHARS, garantiza una hoja única y legible por larga que
-    # sea la observación que escribió Compras.
+    # Junto con MAX_NOTES_CHARS, garantiza una hoja única y legible por largas que
+    # sean las observaciones de Compras y de los aprobadores.
     doc.build([KeepInFrame(doc.width, doc.height, elements, mode="shrink")])
     buffer.seek(0)
     return buffer
@@ -593,6 +680,8 @@ async def fetch_invoice_bundle(client: httpx.AsyncClient, invoice_id: str) -> di
         f"{SUPABASE_URL}/rest/v1/invoices"
         f"?id=eq.{invoice_id}"
         f"&select=*,cost_centers(name)"
+        # invoices tiene varias llaves hacia approvers: hay que decir cuál.
+        f",reviewer:approvers!invoices_reviewed_by_fkey(name)"
         f",invoice_attachments(file_name,storage_path,mime_type,uploaded_at)"
         f",approvals(*,approvers(name,email))"
     )
