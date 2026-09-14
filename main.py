@@ -453,7 +453,10 @@ def generate_approval_page(
         ["Proveedor:", invoice["supplier_name"]],
         ["NIT:", invoice["supplier_nit"]],
         ["Monto Total:", f"${invoice['total_amount']:,.2f} {invoice.get('currency', 'COP')}"],
-        ["Fecha de Recepción:", invoice.get("received_at") or "N/A"],
+        [
+            "Fecha de Recepción:",
+            format_colombia_datetime(invoice.get("received_at"), "%d/%m/%Y %H:%M") or "N/A",
+        ],
     ]
     info_table = Table(info_rows, colWidths=[2 * inch, 4 * inch])
     info_table.setStyle(
