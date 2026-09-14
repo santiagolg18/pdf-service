@@ -403,6 +403,30 @@ def build_index_block(documents, skipped, styles) -> list:
     return elements
 
 
+APPROVAL_STATUS_LABELS = {"approved": "APROBADO", "rejected": "RECHAZADO"}
+
+
+def plural(n: int, singular: str, plural_form: str) -> str:
+    return f"{n} {singular if n == 1 else plural_form}"
+
+
+def approval_rule_text(invoice, total: int) -> str:
+    """La regla con la que se aprobó, para que nadie lea un "falta uno"."""
+    required = min(max(int(invoice.get("required_approvals") or 1), 1), max(total, 1))
+    if invoice.get("approval_mode") == "sequential":
+        rule = f"debían aprobar {'el aprobador' if total == 1 else f'los {total} aprobadores, en orden'}"
+    elif total <= 1:
+        rule = "se requería 1 aprobación"
+    elif required < total:
+        rule = (
+            f"se requería {plural(required, 'aprobación', 'aprobaciones')} de {total} "
+            f"(cualquiera de los aprobadores)"
+        )
+    else:
+        rule = f"se requerían las {total} aprobaciones"
+    return f"<b>Regla:</b> {rule}. <b>Requisito cumplido.</b>"
+
+
 def generate_approval_page(
     invoice,
     approvals,
@@ -456,22 +480,26 @@ def generate_approval_page(
     elements.extend(build_index_block(documents or [], skipped or [], styles))
 
     elements.append(Paragraph("Registro de Aprobaciones:", styles["Heading2"]))
+    elements.append(Spacer(1, 4))
+    elements.append(
+        Paragraph(
+            approval_rule_text(invoice, len(approvals)),
+            ParagraphStyle("Rule", parent=styles["Normal"], fontSize=10),
+        )
+    )
     elements.append(Spacer(1, 8))
 
     header = ["#", "Aprobador", "Estado", "Fecha y Hora"]
     rows = [header]
     for i, a in enumerate(approvals, 1):
-        status_labels = {
-            "approved": "APROBADO",
-            "rejected": "RECHAZADO",
-            "pending": "PENDIENTE",
-        }
-        status_text = status_labels.get(a["status"], "PENDIENTE")
-        date_str = format_colombia_datetime(a.get("approved_at")) or "Pendiente"
+        # La constancia solo se genera con la factura ya aprobada: quien no
+        # decidió no tenía nada pendiente, el umbral se cumplió sin su firma.
+        status_text = APPROVAL_STATUS_LABELS.get(a["status"], "NO REQUERIDA")
+        date_str = format_colombia_datetime(a.get("approved_at")) or "—"
         rows.append([str(i), a["approver_name"], status_text, date_str])
 
     approval_table = Table(
-        rows, colWidths=[0.5 * inch, 2.5 * inch, 1.5 * inch, 2 * inch]
+        rows, colWidths=[0.4 * inch, 2.4 * inch, 1.7 * inch, 2 * inch]
     )
     approval_table.setStyle(
         TableStyle(
@@ -768,7 +796,10 @@ async def generate_final_pdf(request: GeneratePDFRequest):
                 "status": a["status"],
                 "approved_at": a.get("approved_at"),
             }
-            for a in invoice.get("approvals", [])
+            for a in sorted(
+                invoice.get("approvals", []),
+                key=lambda a: (a.get("approval_order") or 0, a.get("created_at") or ""),
+            )
         ]
 
         stamp_bytes = await fetch_approval_stamp(client)
