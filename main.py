@@ -31,12 +31,14 @@ import datetime
 import io
 import logging
 import os
+import re
 from dataclasses import dataclass
 from xml.sax.saxutils import escape
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from PIL import Image as PILImage
+from PIL import ImageOps
 from PyPDF2 import PdfMerger, PdfReader
 from pydantic import BaseModel
 from reportlab.lib import colors
@@ -565,9 +567,15 @@ class AnnexedDocument:
     pages: int
 
 
-# Imágenes que Pillow decodifica sin dependencias extra. heic/heif quedan fuera
-# a propósito: necesitarían pillow-heif en la imagen de Docker.
-IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif"}
+# Imágenes que Pillow decodifica sin dependencias extra (MPO es el JPEG de
+# algunos celulares). heic/heif quedan fuera a propósito: necesitarían
+# pillow-heif en la imagen de Docker.
+IMAGE_FORMATS = {"JPEG", "MPO", "PNG", "GIF", "WEBP", "BMP", "TIFF"}
+
+# Etiqueta EXIF con la rotación de la foto. 1 = ya está derecha.
+EXIF_ORIENTATION = 0x0112
+
+ORIGINAL_TITLE = "Factura original"
 
 # Tope acumulado de lo que se anexa. Cada soporte puede pesar 10 MB y el
 # servicio devuelve además el PDF entero en base64 (+33% de memoria); sin tope,
@@ -575,16 +583,47 @@ IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif"}
 MAX_MERGE_BYTES = 40 * 1024 * 1024
 
 
-def extension_of(name: str) -> str:
-    parts = (name or "").lower().rsplit(".", 1)
-    return parts[1] if len(parts) == 2 else ""
+def sniff_kind(data: bytes) -> str | None:
+    """"pdf" o "image" según el CONTENIDO del archivo; None si no es anexable.
+
+    No se mira el nombre: una factura cargada a mano puede ser una foto, y un
+    archivo puede venir con la extensión equivocada. Excel, Word, ZIP, correos y
+    heic caen en None y se listan como "no anexados".
+    """
+    # La especificación admite basura antes de la cabecera, dentro del primer KB.
+    if b"%PDF-" in data[:1024]:
+        return "pdf"
+    try:
+        with PILImage.open(io.BytesIO(data)) as img:
+            return "image" if img.format in IMAGE_FORMATS else None
+    except Exception:  # noqa: BLE001 — no es una imagen que Pillow entienda
+        return None
+
+
+def storage_segment(value) -> str:
+    """Segmento seguro para una key de Storage.
+
+    Storage rechaza la key entera ("Invalid key") si trae símbolos como # % ° o
+    tildes, y un número de factura digitado a mano puede traer cualquiera. Los
+    espacios se conservan: son válidos y los PDF ya generados los tienen.
+    """
+    return re.sub(r"[^\w.\- ]+", "_", str(value), flags=re.ASCII).strip() or "_"
 
 
 def image_to_pdf(data: bytes) -> bytes | None:
     """Convierte una imagen en una página tamaño carta, centrada y sin deformar."""
     try:
         with PILImage.open(io.BytesIO(data)) as img:
-            width, height = img.size
+            if img.getexif().get(EXIF_ORIENTATION, 1) != 1:
+                # Las fotos de celular guardan la rotación en EXIF en vez de
+                # girar los píxeles: sin esto la factura saldría acostada.
+                upright = ImageOps.exif_transpose(img).convert("RGB")
+                rotated = io.BytesIO()
+                upright.save(rotated, "JPEG", quality=90)
+                data = rotated.getvalue()
+                width, height = upright.size
+            else:
+                width, height = img.size
         if not width or not height:
             return None
 
@@ -615,15 +654,15 @@ def image_to_pdf(data: bytes) -> bytes | None:
 
 def to_annexed_document(title: str, file_name: str, data: bytes) -> AnnexedDocument | None:
     """Deja un archivo listo para anexar, o None si no se puede pegar a un PDF."""
-    ext = extension_of(file_name)
+    kind = sniff_kind(data)
 
-    if ext in IMAGE_EXTENSIONS:
+    if kind == "image":
         converted = image_to_pdf(data)
         if converted is None:
             return None
         return AnnexedDocument(title=title, pdf=converted, pages=1)
 
-    if ext != "pdf":
+    if kind != "pdf":
         # Excel, Word, ZIP, correos, heic... convertirlos exigiría LibreOffice
         # dentro de la imagen de Docker. Se listan como "no anexados".
         return None
@@ -638,15 +677,22 @@ def to_annexed_document(title: str, file_name: str, data: bytes) -> AnnexedDocum
     return AnnexedDocument(title=title, pdf=data, pages=pages)
 
 
-async def collect_documents(client: httpx.AsyncClient, invoice) -> tuple[list, list]:
+async def collect_documents(
+    client: httpx.AsyncClient, invoice
+) -> tuple[list, list, str | None]:
     """Baja y prepara todo el expediente: factura, orden de compra y soportes.
 
-    Devuelve (documentos anexables, nombres de los que no se pudieron anexar).
-    Ningún fallo de descarga o de lectura interrumpe la generación del PDF: el
-    archivo problemático se reporta como no anexado y el expediente sale igual.
+    Devuelve (documentos anexables, nombres de los que no se pudieron anexar,
+    problema con la factura original). Un anexo que falla al bajar o al leerse
+    no interrumpe la generación: se reporta como no anexado y el expediente sale
+    igual. La factura original es la excepción: si falta, el tercer valor dice
+    por qué ("missing" o "unreadable") y quien llama decide no generar.
     """
+    original_path = invoice.get("pdf_storage_path")
     pendientes = [
-        ("Factura original", invoice.get("pdf_storage_path"), "factura.pdf"),
+        # El nombre es la ruta real: una factura cargada a mano puede ser una
+        # foto. Con un "factura.pdf" fijo las imágenes se leían como PDF.
+        (ORIGINAL_TITLE, original_path, original_path or ""),
     ]
     if invoice.get("po_storage_path"):
         po_path = invoice["po_storage_path"]
@@ -661,34 +707,44 @@ async def collect_documents(client: httpx.AsyncClient, invoice) -> tuple[list, l
 
     documentos: list[AnnexedDocument] = []
     no_anexados: list[str] = []
+    problema_original: str | None = None
     acumulado = 0
 
     for titulo, path, file_name in pendientes:
         etiqueta = titulo.replace("Soporte: ", "")
+        es_original = titulo == ORIGINAL_TITLE
         if not path:
             no_anexados.append(etiqueta)
+            if es_original:
+                problema_original = "missing"
             continue
 
         data = await download_storage_object(client, path)
         if data is None:
             logger.warning("No se pudo descargar '%s' desde %s", etiqueta, path)
             no_anexados.append(etiqueta)
+            if es_original:
+                problema_original = "missing"
             continue
 
         if acumulado + len(data) > MAX_MERGE_BYTES:
             logger.warning("'%s' excede el tope de %s bytes; no se anexa", etiqueta, MAX_MERGE_BYTES)
             no_anexados.append(f"{etiqueta} (demasiado grande)")
+            if es_original:
+                problema_original = "unreadable"
             continue
 
         documento = to_annexed_document(titulo, file_name, data)
         if documento is None:
             no_anexados.append(etiqueta)
+            if es_original:
+                problema_original = "unreadable"
             continue
 
         acumulado += len(documento.pdf)
         documentos.append(documento)
 
-    return documentos, no_anexados
+    return documentos, no_anexados, problema_original
 
 
 def merge_documents(approval_page: io.BytesIO, documents) -> bytes:
@@ -786,11 +842,21 @@ async def generate_final_pdf(request: GeneratePDFRequest):
 
         # Se baja y se cuenta TODO el expediente antes de dibujar la constancia:
         # el índice necesita saber en qué página empieza cada documento.
-        documents, skipped = await collect_documents(client, invoice)
-        if not documents:
+        documents, skipped, original_problem = await collect_documents(client, invoice)
+        # El expediente nunca sale sin la factura: antes, con una OC anexada, se
+        # generaba igual y nadie notaba que faltaba el documento principal.
+        if original_problem == "missing":
             raise HTTPException(
                 status_code=404,
-                detail=f"No se pudo descargar la factura original de {invoice['pdf_storage_path']}",
+                detail=f"No se encontró el archivo de la factura original en {invoice['pdf_storage_path']}",
+            )
+        if original_problem:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"El archivo de la factura original ({invoice['pdf_storage_path']}) "
+                    "no es un PDF ni una imagen legible"
+                ),
             )
 
         approvals_payload = [
@@ -811,7 +877,10 @@ async def generate_final_pdf(request: GeneratePDFRequest):
         )
         final_pdf = merge_documents(approval_page, documents)
 
-        final_path = f"{STORAGE_BUCKET}/aprobadas/{invoice['supplier_nit']}/{invoice['invoice_number']}_aprobada.pdf"
+        final_path = (
+            f"{STORAGE_BUCKET}/aprobadas/{storage_segment(invoice['supplier_nit'])}"
+            f"/{storage_segment(invoice['invoice_number'])}_aprobada.pdf"
+        )
         await upload_final_pdf(client, final_path, final_pdf)
         await patch_invoice_final_path(client, request.invoice_id, final_path)
 
