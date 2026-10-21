@@ -12,7 +12,8 @@ Flujo:
      y convierte a PDF los que son imágenes (collect_documents).
   4. Genera la hoja de constancia con reportlab: datos de la factura, resumen de
      la revisión de compras, compilado de observaciones (Compras y aprobadores),
-     índice del expediente y registro de aprobaciones. Siempre ocupa UNA página.
+     índice del expediente y registro de aprobaciones con la firma de cada
+     aprobador. Siempre ocupa UNA página.
   5. Fusiona constancia + documentos con PyPDF2, en ese orden.
   6. Sube el PDF final a Storage y actualiza invoices.final_pdf_path.
   7. Responde con la ruta + base64 del PDF (opcional para adjuntar en email).
@@ -26,6 +27,7 @@ Variables de entorno requeridas:
   STORAGE_BUCKET     — opcional, default "invoices"
 """
 
+import asyncio
 import base64
 import datetime
 import io
@@ -407,6 +409,38 @@ def build_index_block(documents, skipped, styles) -> list:
 
 APPROVAL_STATUS_LABELS = {"approved": "APROBADO", "rejected": "RECHAZADO"}
 
+# Caja de la firma en la tabla de aprobaciones (unos 3,4 × 1 cm). Pequeña a
+# propósito: la constancia tiene que caber en una hoja con todos los aprobadores.
+SIGNATURE_MAX_WIDTH = 1.35 * inch
+SIGNATURE_MAX_HEIGHT = 0.40 * inch
+
+
+def signature_flowable(data: bytes | None):
+    """La firma del aprobador, escalada para caber en su caja de la tabla.
+
+    La app ya la entrega recortada, sin fondo y en negro (PNG transparente);
+    aquí solo se vuelve a recortar al trazo visible por si acaso. Si la imagen
+    no sirve se omite: una firma dañada nunca puede romper la constancia.
+    """
+    if not data:
+        return None
+    try:
+        img = PILImage.open(io.BytesIO(data))
+        img.load()
+        img = img.convert("RGBA")
+        bbox = img.getchannel("A").getbbox()
+        if not bbox:
+            return None
+        img = img.crop(bbox)
+        png = io.BytesIO()
+        img.save(png, format="PNG")
+        png.seek(0)
+        scale = min(SIGNATURE_MAX_WIDTH / img.width, SIGNATURE_MAX_HEIGHT / img.height)
+        return Image(png, width=img.width * scale, height=img.height * scale)
+    except Exception as exc:  # noqa: BLE001 — firma opcional, nunca debe romper el flujo
+        logger.warning("No se pudo usar la imagen de una firma: %s", exc)
+        return None
+
 
 def plural(n: int, singular: str, plural_form: str) -> str:
     return f"{n} {singular if n == 1 else plural_form}"
@@ -494,17 +528,45 @@ def generate_approval_page(
     )
     elements.append(Spacer(1, 8))
 
-    header = ["#", "Aprobador", "Estado", "Fecha y Hora"]
+    name_style = ParagraphStyle(
+        "ApproverName", parent=styles["Normal"], fontSize=10, leading=12, alignment=1
+    )
+    no_signature_style = ParagraphStyle(
+        "NoSignature",
+        parent=styles["Normal"],
+        fontSize=8,
+        leading=10,
+        alignment=1,
+        textColor=colors.grey,
+    )
+
+    header = ["#", "Aprobador", "Estado", "Firma", "Fecha y Hora"]
     rows = [header]
     for i, a in enumerate(approvals, 1):
         # La constancia solo se genera con la factura ya aprobada: quien no
         # decidió no tenía nada pendiente, el umbral se cumplió sin su firma.
         status_text = APPROVAL_STATUS_LABELS.get(a["status"], "NO REQUERIDA")
         date_str = format_colombia_datetime(a.get("approved_at")) or "—"
-        rows.append([str(i), a["approver_name"], status_text, date_str])
+        if a["status"] == "approved":
+            signature = signature_flowable(a.get("signature_bytes")) or Paragraph(
+                "Sin firma registrada", no_signature_style
+            )
+        else:
+            signature = "—"
+        rows.append(
+            [
+                str(i),
+                Paragraph(escape(a["approver_name"]), name_style),
+                status_text,
+                signature,
+                date_str,
+            ]
+        )
 
+    # Suman las mismas 6,5" de antes: la columna de la firma salió del nombre
+    # y del estado.
     approval_table = Table(
-        rows, colWidths=[0.4 * inch, 2.4 * inch, 1.7 * inch, 2 * inch]
+        rows, colWidths=[0.35 * inch, 1.95 * inch, 1.2 * inch, 1.5 * inch, 1.5 * inch]
     )
     approval_table.setStyle(
         TableStyle(
@@ -514,10 +576,14 @@ def generate_approval_page(
                 ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                 ("FONTSIZE", (0, 0), (-1, -1), 10),
                 ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                 ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
                 ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f1f5f9")]),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
                 ("TOPPADDING", (0, 0), (-1, -1), 8),
+                # La firma ya es alta: menos relleno para que la fila no crezca de más.
+                ("TOPPADDING", (3, 1), (3, -1), 3),
+                ("BOTTOMPADDING", (3, 1), (3, -1), 3),
             ]
         )
     )
@@ -544,7 +610,8 @@ def generate_approval_page(
         Paragraph(
             f"<i>Documento generado automáticamente el {gen_date}. "
             f"Este documento certifica que las aprobaciones fueron registradas "
-            f"electrónicamente en el sistema.</i>",
+            f"electrónicamente en el sistema. La firma que aparece es la imagen "
+            f"registrada por cada aprobador en el sistema al momento de aprobar.</i>",
             ParagraphStyle("Footer", parent=styles["Normal"], fontSize=9, textColor=colors.grey),
         )
     )
@@ -806,6 +873,21 @@ async def download_storage_object(client: httpx.AsyncClient, storage_path: str) 
     return resp.content
 
 
+async def fetch_signatures(client: httpx.AsyncClient, approvals) -> dict[str, bytes | None]:
+    """Descarga en paralelo las firmas de quienes aprobaron, por ruta.
+
+    Cada aprobación guarda la firma que tenía la persona AL APROBAR
+    (approvals.signature_path, la copia un trigger de la base), no la vigente:
+    si la cambia después, sus constancias anteriores no cambian. En paralelo
+    porque la app corta la llamada a los 15 s.
+    """
+    paths = sorted(
+        {a["signature_path"] for a in approvals if a["status"] == "approved" and a.get("signature_path")}
+    )
+    images = await asyncio.gather(*(download_storage_object(client, p) for p in paths))
+    return dict(zip(paths, images))
+
+
 async def upload_final_pdf(client: httpx.AsyncClient, path: str, pdf: bytes) -> None:
     url = f"{SUPABASE_URL}/storage/v1/object/{path}"
     resp = await client.post(
@@ -864,12 +946,17 @@ async def generate_final_pdf(request: GeneratePDFRequest):
                 "approver_name": a["approvers"]["name"],
                 "status": a["status"],
                 "approved_at": a.get("approved_at"),
+                "signature_path": a.get("signature_path"),
             }
             for a in sorted(
                 invoice.get("approvals", []),
                 key=lambda a: (a.get("approval_order") or 0, a.get("created_at") or ""),
             )
         ]
+
+        signatures = await fetch_signatures(client, approvals_payload)
+        for a in approvals_payload:
+            a["signature_bytes"] = signatures.get(a["signature_path"])
 
         stamp_bytes = await fetch_approval_stamp(client)
         approval_page = generate_approval_page(
