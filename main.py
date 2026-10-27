@@ -38,10 +38,12 @@ import base64
 import datetime
 import io
 import logging
+import multiprocessing
 import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from urllib.parse import quote
 from xml.sax.saxutils import escape
@@ -68,7 +70,7 @@ from reportlab.platypus import (
     TableStyle,
 )
 
-from compress import TARGET_DPI, compress_pdf
+from compress import TARGET_DPI, compress_pdf, prefer_oom_kill
 
 logger = logging.getLogger("pdf-service")
 
@@ -994,7 +996,10 @@ async def generate_final_pdf(request: GeneratePDFRequest):
         final_pdf = merge_documents(approval_page, documents)
         # El expediente repite la factura, la OC y los soportes: comprimido
         # ocupa bastante menos en Storage. Si no vale la pena, va tal cual.
-        final_pdf = await run_compress(final_pdf) or final_pdf
+        try:
+            final_pdf = await run_compress(final_pdf) or final_pdf
+        except RuntimeError as exc:
+            logger.warning("Se sube el PDF aprobado sin comprimir: %s", exc)
 
         final_path = (
             f"{STORAGE_BUCKET}/aprobadas/{storage_segment(invoice['supplier_nit'])}"
@@ -1010,14 +1015,35 @@ async def generate_final_pdf(request: GeneratePDFRequest):
     }
 
 
-# PyMuPDF no admite trabajar en varios hilos a la vez: toda compresión pasa por
-# este único hilo. Además así no se bloquea el event loop mientras comprime, y
-# /generate-final-pdf sigue respondiendo durante un barrido.
-_compress_executor = ThreadPoolExecutor(max_workers=1)
+# Cada compresión corre en un proceso aparte que termina al acabar. Así:
+# - la memoria que usa PyMuPDF vuelve al sistema (en el mismo proceso se
+#   quedaba retenida y el servidor de 512 MB se reiniciaba por falta de memoria);
+# - si un PDF necesita más memoria de la que hay, muere ese proceso y no el
+#   servidor (prefer_oom_kill);
+# - de a uno (PyMuPDF no admite varios hilos) y sin bloquear el event loop:
+#   /generate-final-pdf sigue respondiendo durante un barrido.
+def _new_compress_pool() -> ProcessPoolExecutor:
+    ctx = multiprocessing.get_context("forkserver")
+    ctx.set_forkserver_preload(["compress"])
+    return ProcessPoolExecutor(
+        max_workers=1, mp_context=ctx, max_tasks_per_child=1, initializer=prefer_oom_kill
+    )
+
+
+_compress_pool = _new_compress_pool()
 
 
 async def run_compress(data: bytes) -> bytes | None:
-    return await asyncio.get_running_loop().run_in_executor(_compress_executor, compress_pdf, data)
+    """compress_pdf en un proceso aparte. RuntimeError si ese proceso murió."""
+    global _compress_pool
+    pool = _compress_pool
+    try:
+        return await asyncio.get_running_loop().run_in_executor(pool, compress_pdf, data)
+    except BrokenProcessPool:
+        if _compress_pool is pool:
+            pool.shutdown(wait=False)
+            _compress_pool = _new_compress_pool()
+        raise RuntimeError("Se quedó sin memoria comprimiendo el PDF") from None
 
 
 # Un barrido a la vez: si el cron vuelve a llamar mientras otro sigue, se salta.

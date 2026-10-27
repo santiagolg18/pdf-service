@@ -39,6 +39,28 @@ MIN_IMAGE_BYTES = 30_000
 MAX_COLOR_FRACTION = 0.002
 
 
+def _free_cache() -> None:
+    """Vacía la caché de MuPDF.
+
+    MuPDF guarda las imágenes que decodifica (hasta 256 MB) y no las suelta
+    solo: con un escaneo de 8 páginas a 300 dpi el servidor (512 MB) se quedaba
+    sin memoria. Se vacía después de cada página o imagen.
+    """
+    pymupdf.TOOLS.store_shrink(100)
+
+
+def prefer_oom_kill() -> None:
+    """Si falta memoria, que el sistema mate este proceso y no el servidor.
+
+    Se llama al arrancar cada proceso que comprime (main._compress_pool).
+    """
+    try:
+        with open("/proc/self/oom_score_adj", "w") as f:
+            f.write("1000")
+    except OSError:
+        pass  # fuera de Linux no existe
+
+
 def _display_dpi(doc: pymupdf.Document) -> dict[int, float]:
     """La resolución a la que se ve cada imagen, por xref.
 
@@ -54,6 +76,7 @@ def _display_dpi(doc: pymupdf.Document) -> dict[int, float]:
                 continue
             value = info["width"] / (width / 72)
             dpi[xref] = min(dpi.get(xref, value), value)
+        _free_cache()
     return dpi
 
 
@@ -101,6 +124,7 @@ def _shrink_scans(doc: pymupdf.Document) -> None:
             img.save(out, "JPEG", quality=JPEG_QUALITY, optimize=True)
             if len(out.getvalue()) < len(extracted["image"]) * 0.9:
                 doc[0].replace_image(xref, stream=out.getvalue())
+            _free_cache()
         except Exception as exc:  # noqa: BLE001 — una imagen rara no frena el resto
             logger.warning("No se pudo recomprimir la imagen %s: %s", xref, exc)
 
@@ -122,6 +146,7 @@ def _health(data: bytes) -> tuple[int, int] | None:
         for page in doc:
             page.get_pixmap(dpi=20)
             page.get_text()
+            _free_cache()
         warnings = pymupdf.TOOLS.mupdf_warnings()
         return doc.page_count, len([line for line in warnings.splitlines() if line.strip()])
     except Exception:  # noqa: BLE001
@@ -152,6 +177,7 @@ def _build(data: bytes, rewrite: bool) -> bytes | None:
                 quality=JPEG_QUALITY,
                 bitonal=False,
             )
+            _free_cache()
         try:
             doc.subset_fonts()
         except Exception as exc:  # noqa: BLE001 — opcional
