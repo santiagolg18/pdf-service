@@ -19,6 +19,9 @@ from PIL import Image as PILImage
 
 logger = logging.getLogger("pdf-service")
 
+# Los avisos de MuPDF se leen con _health(); impresos solo llenarían el log.
+pymupdf.TOOLS.mupdf_display_errors(False)
+
 TARGET_DPI = 150
 JPEG_QUALITY = 70
 
@@ -102,12 +105,33 @@ def _shrink_scans(doc: pymupdf.Document) -> None:
             logger.warning("No se pudo recomprimir la imagen %s: %s", xref, exc)
 
 
-def compress_pdf(data: bytes) -> bytes | None:
-    """Versión liviana del PDF, o None si no se debe reemplazar el original.
+def _health(data: bytes) -> tuple[int, int] | None:
+    """(páginas, avisos de MuPDF) al dibujar y leer todo el PDF; None si no abre.
 
-    None cuando: no es un PDF legible, está cifrado, el resultado cambia el
-    número de páginas, o no queda al menos MIN_SAVING más liviano.
+    Sirve para comparar el original con el comprimido: un PDF puede verse igual
+    y aun así traer contenido dañado que otro visor (Acrobat, el navegador)
+    muestre mal. Los avisos de MuPDF son globales; esto es seguro porque toda
+    la compresión corre en un solo hilo (main.run_compress).
     """
+    try:
+        doc = pymupdf.open(stream=data, filetype="pdf")
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        pymupdf.TOOLS.reset_mupdf_warnings()
+        for page in doc:
+            page.get_pixmap(dpi=20)
+            page.get_text()
+        warnings = pymupdf.TOOLS.mupdf_warnings()
+        return doc.page_count, len([line for line in warnings.splitlines() if line.strip()])
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        doc.close()
+
+
+def _build(data: bytes, rewrite: bool) -> bytes | None:
+    """El PDF recomprimido, o None si no se pudo procesar."""
     try:
         doc = pymupdf.open(stream=data, filetype="pdf")
     except Exception as exc:  # noqa: BLE001 — PDF dañado: se deja como está
@@ -117,37 +141,56 @@ def compress_pdf(data: bytes) -> bytes | None:
     try:
         if doc.needs_pass or doc.is_encrypted:
             return None
-        pages = doc.page_count
-        if pages == 0:
-            return None
-
         _shrink_scans(doc)
-        # Lo demás (PNG sin comprimir, JPEG de más de 165 dpi...). Las imágenes
-        # en blanco y negro se dejan: a 150 dpi el texto escaneado se rompe.
-        doc.rewrite_images(
-            dpi_threshold=TARGET_DPI + 15,
-            dpi_target=TARGET_DPI,
-            quality=JPEG_QUALITY,
-            bitonal=False,
-        )
+        if rewrite:
+            # Lo demás (PNG sin comprimir, JPEG de más de 165 dpi...). Las
+            # imágenes en blanco y negro se dejan: a 150 dpi el texto escaneado
+            # se rompe.
+            doc.rewrite_images(
+                dpi_threshold=TARGET_DPI + 15,
+                dpi_target=TARGET_DPI,
+                quality=JPEG_QUALITY,
+                bitonal=False,
+            )
         try:
             doc.subset_fonts()
         except Exception as exc:  # noqa: BLE001 — opcional
             logger.info("No se pudieron recortar las fuentes: %s", exc)
-
-        result = doc.tobytes(garbage=4, deflate=True, use_objstms=1)
+        return doc.tobytes(garbage=4, deflate=True, use_objstms=1)
     except Exception as exc:  # noqa: BLE001 — nunca dañar el original
         logger.warning("Falló la compresión del PDF: %s", exc)
         return None
     finally:
         doc.close()
 
-    if len(result) > len(data) * (1 - MIN_SAVING):
+
+def compress_pdf(data: bytes) -> bytes | None:
+    """Versión liviana del PDF, o None si no se debe reemplazar el original.
+
+    None cuando: no es un PDF legible, está cifrado, no queda al menos
+    MIN_SAVING más liviano, o el resultado cambia el número de páginas o trae
+    errores que el original no tenía.
+
+    rewrite_images de PyMuPDF a veces deja el contenido de una página dañado
+    (pasó con un PDF aprobado el 2026-10-27, aunque se veía igual): en ese caso
+    se repite sin ese paso.
+    """
+    original = _health(data)
+    if original is None or original[0] == 0:
         return None
-    try:
-        check = pymupdf.open(stream=result, filetype="pdf")
-        same_pages = check.page_count == pages
-        check.close()
-    except Exception:  # noqa: BLE001
-        return None
-    return result if same_pages else None
+    pages, warnings = original
+
+    for rewrite in (True, False):
+        result = _build(data, rewrite)
+        if result is None:
+            continue
+        if len(result) > len(data) * (1 - MIN_SAVING):
+            # Sin rewrite_images ahorraría todavía menos.
+            return None
+        health = _health(result)
+        if health is not None and health[0] == pages and health[1] <= warnings:
+            return result
+        logger.warning(
+            "La compresión dejó el PDF con errores (rewrite_images=%s); se descarta", rewrite
+        )
+    return None
