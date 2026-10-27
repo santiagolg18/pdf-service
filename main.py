@@ -14,9 +14,14 @@ Flujo:
      la revisión de compras, compilado de observaciones (Compras y aprobadores),
      índice del expediente y registro de aprobaciones con la firma de cada
      aprobador. Siempre ocupa UNA página.
-  5. Fusiona constancia + documentos con PyPDF2, en ese orden.
+  5. Fusiona constancia + documentos con PyPDF2, en ese orden, y comprime el
+     resultado (compress.py).
   6. Sube el PDF final a Storage y actualiza invoices.final_pdf_path.
   7. Responde con la ruta + base64 del PDF (opcional para adjuntar en email).
+
+Además, POST /compress-pending (lo llama un cron de Supabase) comprime en su
+misma ruta los PDF del bucket que aún no se han procesado: facturas del correo,
+órdenes de compra, soportes y facturas manuales.
 
 Deploy:
   uvicorn main:app --host 0.0.0.0 --port 8000
@@ -25,6 +30,7 @@ Variables de entorno requeridas:
   SUPABASE_URL       — ej. https://xxxxx.supabase.co
   SUPABASE_SERVICE_ROLE_KEY  — service_role key
   STORAGE_BUCKET     — opcional, default "invoices"
+  COMPRESS_SECRET    — clave de /compress-pending (en Vault: compress_secret)
 """
 
 import asyncio
@@ -34,11 +40,14 @@ import io
 import logging
 import os
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from urllib.parse import quote
 from xml.sax.saxutils import escape
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from PIL import Image as PILImage
 from PIL import ImageOps
 from PyPDF2 import PdfMerger, PdfReader
@@ -59,11 +68,16 @@ from reportlab.platypus import (
     TableStyle,
 )
 
+from compress import TARGET_DPI, compress_pdf
+
 logger = logging.getLogger("pdf-service")
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 STORAGE_BUCKET = os.environ.get("STORAGE_BUCKET", "invoices")
+# Clave que debe traer quien llama a /compress-pending (el cron de Supabase).
+# Sin ella configurada el endpoint queda apagado.
+COMPRESS_SECRET = os.environ.get("COMPRESS_SECRET", "")
 
 # Sello de certificación que se estampa en la hoja de constancia.
 APPROVAL_STAMP_URL = os.environ.get(
@@ -639,9 +653,6 @@ class AnnexedDocument:
 # pillow-heif en la imagen de Docker.
 IMAGE_FORMATS = {"JPEG", "MPO", "PNG", "GIF", "WEBP", "BMP", "TIFF"}
 
-# Etiqueta EXIF con la rotación de la foto. 1 = ya está derecha.
-EXIF_ORIENTATION = 0x0112
-
 ORIGINAL_TITLE = "Factura original"
 
 # Tope acumulado de lo que se anexa. Cada soporte puede pesar 10 MB y el
@@ -677,39 +688,57 @@ def storage_segment(value) -> str:
     return re.sub(r"[^\w.\- ]+", "_", str(value), flags=re.ASCII).strip() or "_"
 
 
+# Fotos y pantallazos que se anexan como página: un poco más de calidad que en
+# los escaneos (compress.py) porque suelen traer letra pequeña.
+PHOTO_JPEG_QUALITY = 80
+
+
 def image_to_pdf(data: bytes) -> bytes | None:
-    """Convierte una imagen en una página tamaño carta, centrada y sin deformar."""
+    """Convierte una imagen en una página tamaño carta, centrada y sin deformar.
+
+    La imagen se reduce a TARGET_DPI del tamaño al que se dibuja: una foto de
+    celular de 12 megapíxeles no necesita más de ~1.100 × 1.500 píxeles en una
+    hoja carta, y pegarla entera inflaba el PDF aprobado.
+    """
     try:
         with PILImage.open(io.BytesIO(data)) as img:
-            if img.getexif().get(EXIF_ORIENTATION, 1) != 1:
-                # Las fotos de celular guardan la rotación en EXIF en vez de
-                # girar los píxeles: sin esto la factura saldría acostada.
-                upright = ImageOps.exif_transpose(img).convert("RGB")
-                rotated = io.BytesIO()
-                upright.save(rotated, "JPEG", quality=90)
-                data = rotated.getvalue()
-                width, height = upright.size
-            else:
-                width, height = img.size
-        if not width or not height:
-            return None
+            # Las fotos de celular guardan la rotación en EXIF en vez de girar
+            # los píxeles: sin esto la factura saldría acostada.
+            img = ImageOps.exif_transpose(img)
+            if img.mode in ("RGBA", "LA", "P"):
+                # JPEG no tiene transparencia: fondo blanco, como el papel.
+                rgba = img.convert("RGBA")
+                img = PILImage.new("RGB", rgba.size, "white")
+                img.paste(rgba, mask=rgba.getchannel("A"))
+            elif img.mode != "L":
+                img = img.convert("RGB")
+            width, height = img.size
+            if not width or not height:
+                return None
 
-        page_w, page_h = letter
-        margin = 0.5 * inch
-        max_w, max_h = page_w - 2 * margin, page_h - 2 * margin
-        scale = min(max_w / width, max_h / height)
-        draw_w, draw_h = width * scale, height * scale
+            page_w, page_h = letter
+            margin = 0.5 * inch
+            max_w, max_h = page_w - 2 * margin, page_h - 2 * margin
+            scale = min(max_w / width, max_h / height)
+            draw_w, draw_h = width * scale, height * scale
+
+            target_w = round(draw_w / 72 * TARGET_DPI)
+            if width > target_w:
+                target_h = max(1, round(height * target_w / width))
+                img = img.resize((target_w, target_h), PILImage.LANCZOS)
+
+            jpeg = io.BytesIO()
+            img.save(jpeg, "JPEG", quality=PHOTO_JPEG_QUALITY, optimize=True)
 
         buffer = io.BytesIO()
         pdf = canvas.Canvas(buffer, pagesize=letter)
         pdf.drawImage(
-            ImageReader(io.BytesIO(data)),
+            ImageReader(io.BytesIO(jpeg.getvalue())),
             (page_w - draw_w) / 2,
             (page_h - draw_h) / 2,
             width=draw_w,
             height=draw_h,
             preserveAspectRatio=True,
-            mask="auto",
         )
         pdf.showPage()
         pdf.save()
@@ -879,7 +908,7 @@ async def fetch_signatures(client: httpx.AsyncClient, approvals) -> dict[str, by
     Cada aprobación guarda la firma que tenía la persona AL APROBAR
     (approvals.signature_path, la copia un trigger de la base), no la vigente:
     si la cambia después, sus constancias anteriores no cambian. En paralelo
-    porque la app corta la llamada a los 15 s.
+    porque la app corta la llamada a los 30 s.
     """
     paths = sorted(
         {a["signature_path"] for a in approvals if a["status"] == "approved" and a.get("signature_path")}
@@ -963,6 +992,9 @@ async def generate_final_pdf(request: GeneratePDFRequest):
             invoice, approvals_payload, stamp_bytes, documents, skipped
         )
         final_pdf = merge_documents(approval_page, documents)
+        # El expediente repite la factura, la OC y los soportes: comprimido
+        # ocupa bastante menos en Storage. Si no vale la pena, va tal cual.
+        final_pdf = await run_compress(final_pdf) or final_pdf
 
         final_path = (
             f"{STORAGE_BUCKET}/aprobadas/{storage_segment(invoice['supplier_nit'])}"
@@ -975,4 +1007,118 @@ async def generate_final_pdf(request: GeneratePDFRequest):
         "success": True,
         "final_pdf_path": final_path,
         "pdf_base64": base64.b64encode(final_pdf).decode(),
+    }
+
+
+# PyMuPDF no admite trabajar en varios hilos a la vez: toda compresión pasa por
+# este único hilo. Además así no se bloquea el event loop mientras comprime, y
+# /generate-final-pdf sigue respondiendo durante un barrido.
+_compress_executor = ThreadPoolExecutor(max_workers=1)
+
+
+async def run_compress(data: bytes) -> bytes | None:
+    return await asyncio.get_running_loop().run_in_executor(_compress_executor, compress_pdf, data)
+
+
+# Un barrido a la vez: si el cron vuelve a llamar mientras otro sigue, se salta.
+_sweep_lock = asyncio.Lock()
+
+SWEEP_MAX_ITEMS = 40
+SWEEP_MAX_SECONDS = 50
+
+
+async def log_compression(client: httpx.AsyncClient, row: dict) -> None:
+    resp = await client.post(
+        f"{SUPABASE_URL}/rest/v1/storage_compression_log",
+        headers={
+            **SB_HEADERS,
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates,return=minimal",
+        },
+        json={**row, "processed_at": datetime.datetime.now(datetime.timezone.utc).isoformat()},
+    )
+    resp.raise_for_status()
+
+
+async def compress_object(client: httpx.AsyncClient, name: str, size: int | None) -> dict:
+    """Comprime un objeto del bucket en su misma ruta. Devuelve la fila del registro."""
+    row = {"object_name": name, "original_bytes": size, "final_bytes": None, "error": None}
+    path = f"{STORAGE_BUCKET}/{quote(name, safe='/')}"
+    data = await download_storage_object(client, path)
+    if data is None:
+        return {**row, "status": "error", "error": "No se pudo descargar"}
+    row["original_bytes"] = len(data)
+
+    smaller = await run_compress(data)
+    if smaller is None:
+        return {**row, "status": "sin_cambio", "final_bytes": len(data)}
+
+    try:
+        await upload_final_pdf(client, path, smaller)
+    except HTTPException as exc:
+        return {**row, "status": "error", "error": str(exc.detail)[:500]}
+
+    # Los soportes guardan su tamaño en la base y la plataforma lo muestra.
+    await client.patch(
+        f"{SUPABASE_URL}/rest/v1/invoice_attachments",
+        params={"storage_path": f"eq.{STORAGE_BUCKET}/{name}"},
+        headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=minimal"},
+        json={"size_bytes": len(smaller)},
+    )
+    return {**row, "status": "comprimido", "final_bytes": len(smaller)}
+
+
+@app.post("/compress-pending")
+async def compress_pending(x_compress_secret: str = Header(default="")):
+    """Comprime una tanda de PDF del bucket que aún no se han procesado.
+
+    Lo llama un cron de Supabase cada 10 minutos. Cubre todo lo que se sube
+    (correo, Compras, facturas manuales) sin tocar esos flujos: los archivos se
+    reemplazan en su misma ruta, así que la base no cambia.
+    """
+    if not COMPRESS_SECRET or x_compress_secret != COMPRESS_SECRET:
+        raise HTTPException(status_code=401, detail="No autorizado")
+    if _sweep_lock.locked():
+        return {"ocupado": True, "procesados": 0}
+
+    async with _sweep_lock:
+        started = time.monotonic()
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/storage_compression_pending",
+                headers={**SB_HEADERS, "Content-Type": "application/json"},
+                json={"max_items": SWEEP_MAX_ITEMS},
+            )
+            resp.raise_for_status()
+            batch = resp.json()
+
+            processed = 0
+            saved = 0
+            errors = 0
+            for item in batch:
+                if time.monotonic() - started > SWEEP_MAX_SECONDS:
+                    break
+                try:
+                    row = await compress_object(client, item["name"], item.get("size"))
+                except Exception as exc:  # noqa: BLE001 — un archivo no frena la tanda
+                    logger.warning("Falló la compresión de %s: %s", item["name"], exc)
+                    row = {
+                        "object_name": item["name"],
+                        "original_bytes": item.get("size"),
+                        "final_bytes": None,
+                        "status": "error",
+                        "error": str(exc)[:500],
+                    }
+                await log_compression(client, row)
+                processed += 1
+                if row["status"] == "error":
+                    errors += 1
+                elif row["original_bytes"] and row["final_bytes"]:
+                    saved += row["original_bytes"] - row["final_bytes"]
+
+    return {
+        "procesados": processed,
+        "errores": errors,
+        "ahorrado_bytes": saved,
+        "quedan_mas": len(batch) == SWEEP_MAX_ITEMS or processed < len(batch),
     }
